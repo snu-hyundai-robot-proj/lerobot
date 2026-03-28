@@ -20,8 +20,14 @@ from datasets import Dataset
 from huggingface_hub import DatasetCard
 
 from lerobot.datasets.push_dataset_to_hub.utils import calculate_episode_data_index
-from lerobot.datasets.utils import combine_feature_dicts, create_lerobot_dataset_card, hf_transform_to_torch
-from lerobot.utils.constants import ACTION, OBS_IMAGES
+from lerobot.configs.types import FeatureType
+from lerobot.datasets.utils import (
+    combine_feature_dicts,
+    create_lerobot_dataset_card,
+    dataset_to_policy_features,
+    hf_transform_to_torch,
+)
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_TACTILE
 
 
 def test_default_parameters():
@@ -131,3 +137,28 @@ def test_non_dict_passthrough_last_wins():
     out = combine_feature_dicts(g1, g2)
     # For non-dict entries the last one wins
     assert out["misc"] == 456
+
+
+def test_dataset_to_policy_features_tactile():
+    features = {
+        OBS_TACTILE: {"dtype": "float32", "shape": (32,), "names": [f"t{i}" for i in range(32)]},
+    }
+    policy_fts = dataset_to_policy_features(features)
+    assert OBS_TACTILE in policy_fts
+    assert policy_fts[OBS_TACTILE].type is FeatureType.TACTILE
+    assert policy_fts[OBS_TACTILE].shape == (32,)
+
+
+def test_dataset_to_policy_features_bool_segmentation_mask():
+    key = "observation.init.hook_segmentation"
+    features = {
+        key: {
+            "dtype": "bool",
+            "shape": (480, 640, 1),
+            "names": ["height", "width", "channel"],
+        },
+    }
+    policy_fts = dataset_to_policy_features(features)
+    assert key in policy_fts
+    assert policy_fts[key].type is FeatureType.MASK
+    assert policy_fts[key].shape == (1, 480, 640)

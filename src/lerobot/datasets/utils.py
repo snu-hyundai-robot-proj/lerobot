@@ -44,7 +44,7 @@ from lerobot.datasets.backward_compatibility import (
     BackwardCompatibilityError,
     ForwardCompatibilityError,
 )
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STR
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STR, OBS_TACTILE
 from lerobot.utils.utils import SuppressProgressBars, is_valid_numpy_dtype_string
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
@@ -724,6 +724,18 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
                 shape = (shape[2], shape[0], shape[1])
         elif key == OBS_ENV_STATE:
             type = FeatureType.ENV
+        elif key == OBS_TACTILE:
+            type = FeatureType.TACTILE
+        elif (
+            key.startswith(OBS_STR)
+            and str(ft["dtype"]).lower() in ("bool", "boolean")
+            and len(shape) == 3
+        ):
+            # e.g. observation.*.hook_segmentation: (H, W, C) bool — same channel-last→first rule as images.
+            type = FeatureType.MASK
+            names = ft.get("names") or []
+            if len(names) >= 3 and names[2] in ["channel", "channels"]:
+                shape = (shape[2], shape[0], shape[1])
         elif key.startswith(OBS_STR):
             type = FeatureType.STATE
         elif key.startswith(ACTION):

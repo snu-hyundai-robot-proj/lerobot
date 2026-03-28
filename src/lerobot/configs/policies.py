@@ -29,7 +29,7 @@ from huggingface_hub.errors import HfHubHTTPError
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.optim.optimizers import OptimizerConfig
 from lerobot.optim.schedulers import LRSchedulerConfig
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_STATE, OBS_TACTILE
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 
@@ -146,10 +146,26 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
         return None
 
     @property
+    def tactile_feature(self) -> PolicyFeature | None:
+        if not self.input_features:
+            return None
+        for ft_name, ft in self.input_features.items():
+            if ft.type is FeatureType.TACTILE and ft_name == OBS_TACTILE:
+                return ft
+        return None
+
+    @property
     def image_features(self) -> dict[str, PolicyFeature]:
         if not self.input_features:
             return {}
         return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.VISUAL}
+
+    @property
+    def mask_features(self) -> dict[str, PolicyFeature]:
+        """Boolean or segmentation-like observation tensors (e.g. hook_segmentation), channel-first (C,H,W)."""
+        if not self.input_features:
+            return {}
+        return {key: ft for key, ft in self.input_features.items() if ft.type is FeatureType.MASK}
 
     @property
     def action_feature(self) -> PolicyFeature | None:

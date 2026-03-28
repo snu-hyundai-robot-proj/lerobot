@@ -35,7 +35,79 @@ from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_MASKS, OBS_STATE, OBS_TACTILE
+
+
+def _act_reference_tensor(batch: dict[str, Tensor]) -> Tensor:
+    """Return any model-input tensor to infer batch device/dtype (single-device batches)."""
+    if OBS_IMAGES in batch and batch[OBS_IMAGES]:
+        return batch[OBS_IMAGES][0]
+    if OBS_MASKS in batch and batch[OBS_MASKS]:
+        return batch[OBS_MASKS][0]
+    if OBS_TACTILE in batch:
+        return batch[OBS_TACTILE]
+    if OBS_STATE in batch:
+        return batch[OBS_STATE]
+    return batch[OBS_ENV_STATE]
+
+
+def _pack_act_policy_batch(config: ACTConfig, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Build `OBS_IMAGES` / `OBS_MASKS` lists for ACT.forward (shallow-copy batch when needed)."""
+    if not config.image_features and not (config.use_mask and config.mask_features):
+        return batch
+    out = dict(batch)
+    if config.image_features:
+        out[OBS_IMAGES] = [out[key] for key in config.image_features]
+    if config.use_mask and config.mask_features:
+        out[OBS_MASKS] = [out[key] for key in config.mask_features]
+    return out
+
+
+class TactileCNN1DEncoder(nn.Module):
+    """Single 1D CNN over the full tactile vector: (B, tactile_dim) -> (B, 1, d_model)."""
+
+    def __init__(self, tactile_dim: int, hidden_dim: int, d_model: int) -> None:
+        super().__init__()
+        if tactile_dim < 1:
+            raise ValueError(f"tactile_dim must be >= 1, got {tactile_dim}")
+        self.tactile_dim = tactile_dim
+        self.trunk = nn.Sequential(
+            nn.Conv1d(1, hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.out_proj = nn.Linear(hidden_dim, d_model)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B, tactile_dim)
+        x = x.unsqueeze(1)  # (B, 1, tactile_dim)
+        x = self.trunk(x)
+        x = self.pool(x).squeeze(-1)  # (B, hidden_dim)
+        return self.out_proj(x).unsqueeze(1)  # (B, 1, d_model)
+
+
+class MaskSpatialEncoder(nn.Module):
+    """Conv tower for segmentation masks (B, C, H, W) -> feature map (B, d_model, h', w'), image-style."""
+
+    def __init__(self, in_channels: int, d_model: int, base_dim: int) -> None:
+        super().__init__()
+        if in_channels < 1:
+            raise ValueError(f"in_channels must be >= 1, got {in_channels}")
+        mid = base_dim * 2
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, base_dim, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(base_dim, mid, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.proj = nn.Conv2d(mid, d_model, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(self.net(x))
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -126,18 +198,14 @@ class ACTPolicy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        batch = _pack_act_policy_batch(self.config, batch)
 
         actions = self.model(batch)[0]
         return actions
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+        batch = _pack_act_policy_batch(self.config, batch)
 
         actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
 
@@ -350,15 +418,34 @@ class ACT(nn.Module):
             self.encoder_img_feat_input_proj = nn.Conv2d(
                 backbone_model.fc.in_features, config.dim_model, kernel_size=1
             )
+        if self.config.use_tactile:
+            self.tactile_encoder = TactileCNN1DEncoder(
+                tactile_dim=config.tactile_dim,
+                hidden_dim=config.tactile_hidden_dim,
+                d_model=config.dim_model,
+            )
+        if self.config.use_mask and self.config.mask_features:
+            self.mask_encoders = nn.ModuleDict(
+                {
+                    name: MaskSpatialEncoder(
+                        in_channels=ft.shape[0],
+                        d_model=config.dim_model,
+                        base_dim=config.mask_encoder_base_dim,
+                    )
+                    for name, ft in config.mask_features.items()
+                }
+            )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
         if self.config.robot_state_feature:
             n_1d_tokens += 1
         if self.config.env_state_feature:
             n_1d_tokens += 1
+        if self.config.use_tactile:
+            n_1d_tokens += 1
         self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
-        if self.config.image_features:
-            self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
+        if self.config.image_features or (self.config.use_mask and self.config.mask_features):
+            self.encoder_spatial_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
 
         # Transformer decoder.
         # Learnable positional embedding for the transformer's decoder (in the style of DETR object queries).
@@ -399,7 +486,39 @@ class ACT(nn.Module):
                 "actions must be provided when using the variational objective in training mode."
             )
 
-        batch_size = batch[OBS_IMAGES][0].shape[0] if OBS_IMAGES in batch else batch[OBS_ENV_STATE].shape[0]
+        if self.config.use_tactile:
+            if OBS_TACTILE not in batch:
+                raise ValueError(
+                    "observation.tactile is required in the batch when ACTConfig.use_tactile is True."
+                )
+            tactile_b = batch[OBS_TACTILE]
+            if tactile_b.shape[-1] != self.config.tactile_dim:
+                raise ValueError(
+                    f"observation.tactile last dim must be tactile_dim={self.config.tactile_dim}, "
+                    f"got shape {tuple(tactile_b.shape)}."
+                )
+
+        if self.config.use_mask and self.config.mask_features:
+            if OBS_MASKS not in batch or not batch[OBS_MASKS]:
+                raise ValueError(
+                    f"Batch must include non-empty '{OBS_MASKS}' when use_mask=True. "
+                    "ACTPolicy packs it from dataset keys in mask_features."
+                )
+            if len(batch[OBS_MASKS]) != len(self.config.mask_features):
+                raise ValueError(
+                    f"Expected {len(self.config.mask_features)} mask tensors in '{OBS_MASKS}', "
+                    f"got {len(batch[OBS_MASKS])}."
+                )
+            for key, m in zip(self.config.mask_features.keys(), batch[OBS_MASKS], strict=True):
+                expected_shape = self.config.mask_features[key].shape  # (C, H, W)
+                if tuple(m.shape[-3:]) != expected_shape:
+                    raise ValueError(
+                        f"Mask {key!r} must have trailing shape {expected_shape} (B, C, H, W); "
+                        f"got {tuple(m.shape)}."
+                    )
+
+        ref = _act_reference_tensor(batch)
+        batch_size = ref.shape[0]
 
         # Prepare the latent for input to the transformer encoder.
         if self.config.use_vae and ACTION in batch and self.training:
@@ -428,7 +547,7 @@ class ACT(nn.Module):
             cls_joint_is_pad = torch.full(
                 (batch_size, 2 if self.config.robot_state_feature else 1),
                 False,
-                device=batch[OBS_STATE].device,
+                device=ref.device,
             )
             key_padding_mask = torch.cat(
                 [cls_joint_is_pad, batch["action_is_pad"]], axis=1
@@ -450,9 +569,9 @@ class ACT(nn.Module):
         else:
             # When not using the VAE encoder, we set the latent to be all zeros.
             mu = log_sigma_x2 = None
-            # TODO(rcadene, alexander-soare): remove call to `.to` to speedup forward ; precompute and use buffer
-            latent_sample = torch.zeros([batch_size, self.config.latent_dim], dtype=torch.float32).to(
-                batch[OBS_STATE].device
+            # TODO(rcadene, alexander-soare): precompute this zero latent and use a buffer to avoid reallocating every forward pass.
+            latent_sample = torch.zeros(
+                [batch_size, self.config.latent_dim], dtype=ref.dtype, device=ref.device
             )
 
         # Prepare transformer encoder inputs.
@@ -465,13 +584,22 @@ class ACT(nn.Module):
         if self.config.env_state_feature:
             encoder_in_tokens.append(self.encoder_env_state_input_proj(batch[OBS_ENV_STATE]))
 
+        # Tactile token (single); VAE path unchanged — tactile conditions the decoder transformer only.
+        # TODO(lcw):
+        # 1) Add bidirectional cross-attention between visual and tactile features
+        #    (perform fusion before this transformer stack).
+        # 2) Optional: explicit cross-attention between tactile tokens and mask spatial tokens (beyond concat).
+        if self.config.use_tactile:
+            tactile_tok = self.tactile_encoder(batch[OBS_TACTILE])  # (B, 1, D)
+            encoder_in_tokens.append(tactile_tok.squeeze(1))  # (B, D) — stacked to (S, B, D) below
+
         if self.config.image_features:
             # For a list of images, the H and W may vary but H*W is constant.
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch[OBS_IMAGES]:
                 cam_features = self.backbone(img)["feature_map"]
-                cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
+                cam_pos_embed = self.encoder_spatial_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
 
                 # Rearrange features to (sequence, batch, dim).
@@ -482,6 +610,16 @@ class ACT(nn.Module):
                 # Convert to list to extend properly
                 encoder_in_tokens.extend(list(cam_features))
                 encoder_in_pos_embed.extend(list(cam_pos_embed))
+
+        if self.config.use_mask and self.config.mask_features:
+            for key, mask in zip(self.config.mask_features.keys(), batch[OBS_MASKS], strict=True):
+                x = mask.float() if mask.dtype == torch.bool else mask.to(dtype=ref.dtype)
+                mask_features = self.mask_encoders[key](x)
+                mask_pos = self.encoder_spatial_feat_pos_embed(mask_features).to(dtype=mask_features.dtype)
+                mask_features = einops.rearrange(mask_features, "b c h w -> (h w) b c")
+                mask_pos = einops.rearrange(mask_pos, "b c h w -> (h w) b c")
+                encoder_in_tokens.extend(list(mask_features))
+                encoder_in_pos_embed.extend(list(mask_pos))
 
         # Stack all tokens along the sequence dimension.
         encoder_in_tokens = torch.stack(encoder_in_tokens, axis=0)

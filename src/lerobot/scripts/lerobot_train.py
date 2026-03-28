@@ -34,6 +34,8 @@ from lerobot.datasets.utils import cycle
 from lerobot.envs.factory import make_env, make_env_pre_post_processors
 from lerobot.envs.utils import close_envs
 from lerobot.optim.factory import make_optimizer_and_scheduler
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.processor_act import make_act_collate_fn
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
@@ -356,6 +358,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         shuffle = True
         sampler = None
 
+    act_collate_fn = None
+    if isinstance(cfg.policy, ACTConfig) and cfg.policy.use_tactile:
+        act_collate_fn = make_act_collate_fn(cfg.policy)
+
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -365,6 +371,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
+        collate_fn=act_collate_fn,
     )
 
     # Prepare everything with accelerator

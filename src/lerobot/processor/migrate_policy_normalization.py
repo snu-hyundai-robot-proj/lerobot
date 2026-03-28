@@ -160,6 +160,10 @@ def detect_features_and_norm_modes(
                     feature_type = FeatureType.STATE
                 elif feature_type_str == "ACTION":
                     feature_type = FeatureType.ACTION
+                elif feature_type_str == "TACTILE":
+                    feature_type = FeatureType.TACTILE
+                elif feature_type_str == "MASK":
+                    feature_type = FeatureType.MASK
                 else:
                     print(f"Warning: Unknown feature type '{feature_type_str}', skipping")
                     continue

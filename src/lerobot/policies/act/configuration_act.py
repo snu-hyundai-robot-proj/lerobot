@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim.optimizers import AdamWConfig
+from lerobot.utils.constants import OBS_TACTILE
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -39,6 +40,8 @@ class ACTConfig(PreTrainedConfig):
           views. Right now we only support all images having the same shape.
         - May optionally work without an "observation.state" key for the proprioceptive robot state.
         - "action" is required as an output key.
+        - Optional modalities are gated explicitly: `use_tactile` and `use_mask` (default False for backward
+          compatibility). When False, the model ignores corresponding keys even if present in the dataset batch.
 
     Args:
         n_obs_steps: Number of environment steps worth of observations to pass to the policy (takes the
@@ -90,6 +93,8 @@ class ACTConfig(PreTrainedConfig):
         default_factory=lambda: {
             "VISUAL": NormalizationMode.MEAN_STD,
             "STATE": NormalizationMode.MEAN_STD,
+            "TACTILE": NormalizationMode.MEAN_STD,
+            "MASK": NormalizationMode.IDENTITY,
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
@@ -128,6 +133,17 @@ class ACTConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-4
     optimizer_lr_backbone: float = 1e-5
 
+    # Tactile (optional modality; backward compatible when use_tactile=False).
+    use_tactile: bool = False
+    tactile_dim: int = 32
+    # Full-vector 1D CNN: [B, tactile_dim] -> [B, 1, tactile_dim] Conv1d stack -> one token [B, 1, dim_model].
+    tactile_encoder_type: str = "cnn1d"
+    tactile_hidden_dim: int = 32
+
+    # Segmentation masks (FeatureType.MASK): when True, CNN mask tower feeds spatial tokens (like RGB patches).
+    use_mask: bool = False
+    mask_encoder_base_dim: int = 64
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -150,6 +166,17 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+        if self.use_tactile:
+            allowed_tactile_encoders = ("cnn1d", "single_branch_cnn")
+            if self.tactile_encoder_type not in allowed_tactile_encoders:
+                raise ValueError(
+                    f"ACT tactile_encoder_type must be one of {allowed_tactile_encoders}. "
+                    f"Got {self.tactile_encoder_type!r}."
+                )
+            if self.tactile_hidden_dim < 1:
+                raise ValueError(f"tactile_hidden_dim must be >= 1, got {self.tactile_hidden_dim}.")
+        if self.use_mask and self.mask_features and self.mask_encoder_base_dim < 1:
+            raise ValueError(f"mask_encoder_base_dim must be >= 1, got {self.mask_encoder_base_dim}.")
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(
@@ -163,6 +190,28 @@ class ACTConfig(PreTrainedConfig):
     def validate_features(self) -> None:
         if not self.image_features and not self.env_state_feature:
             raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if self.use_tactile:
+            tactile = self.tactile_feature
+            if tactile is None:
+                raise ValueError(
+                    f"When use_tactile=True, input_features must include '{OBS_TACTILE}' with "
+                    f"FeatureType.TACTILE."
+                )
+            if tactile.shape[-1] != self.tactile_dim:
+                raise ValueError(
+                    f"observation.tactile last dimension must equal tactile_dim ({self.tactile_dim}). "
+                    f"Got feature shape {tactile.shape}."
+                )
+        if self.use_mask:
+            if not self.mask_features:
+                raise ValueError(
+                    "When use_mask=True, input_features must include at least one FeatureType.MASK observation."
+                )
+            for key, ft in self.mask_features.items():
+                if len(ft.shape) != 3:
+                    raise ValueError(
+                        f"Mask feature {key!r} must have channel-first shape (C, H, W); got {ft.shape}."
+                    )
 
     @property
     def observation_delta_indices(self) -> None:
