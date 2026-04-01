@@ -19,6 +19,8 @@ from enum import Enum
 
 class FeatureType(str, Enum):
     STATE = "STATE"
+    TACTILE = "TACTILE"
+    MASK = "MASK"
     VISUAL = "VISUAL"
     ENV = "ENV"
     ACTION = "ACTION"

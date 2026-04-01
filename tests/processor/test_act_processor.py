@@ -22,7 +22,8 @@ import torch
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.processor_act import make_act_pre_post_processors
+from lerobot.policies.act.modeling_act import ACTPolicy
+from lerobot.policies.act.processor_act import make_act_collate_fn, make_act_pre_post_processors
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
@@ -33,7 +34,7 @@ from lerobot.processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import create_transition, transition_to_batch
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE, OBS_TACTILE
 
 
 def create_default_config():
@@ -410,3 +411,63 @@ def test_act_processor_bfloat16_device_float32_normalizer():
     assert normalizer_step.dtype == torch.bfloat16
     for stat_tensor in normalizer_step._tensor_stats[OBS_STATE].values():
         assert stat_tensor.dtype == torch.bfloat16
+
+
+def test_make_act_collate_fn_tactile_shape():
+    cam = f"{OBS_IMAGES}.cam"
+    cfg = ACTConfig(use_tactile=True, use_vae=False, chunk_size=4, n_action_steps=4)
+    cfg.input_features = {
+        cam: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+        OBS_TACTILE: PolicyFeature(type=FeatureType.TACTILE, shape=(32,)),
+    }
+    cfg.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+    collate = make_act_collate_fn(cfg)
+    rows = [
+        {cam: torch.zeros(3, 32, 32), OBS_TACTILE: torch.zeros(32), ACTION: torch.zeros(4, 2)},
+        {cam: torch.ones(3, 32, 32), OBS_TACTILE: torch.ones(32), ACTION: torch.ones(4, 2)},
+    ]
+    batch = collate(rows)
+    assert batch[OBS_TACTILE].shape == (2, 32)
+
+
+def test_act_policy_forward_with_tactile():
+    cam = f"{OBS_IMAGES}.cam"
+    cfg = ACTConfig(use_tactile=True, use_vae=False, chunk_size=4, n_action_steps=4)
+    cfg.input_features = {
+        cam: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+        OBS_TACTILE: PolicyFeature(type=FeatureType.TACTILE, shape=(32,)),
+    }
+    cfg.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+    policy = ACTPolicy(cfg)
+    policy.train()
+    B = 2
+    batch = {
+        cam: torch.randn(B, 3, 32, 32),
+        OBS_TACTILE: torch.randn(B, 32),
+        ACTION: torch.randn(B, 4, 2),
+        "action_is_pad": torch.zeros(B, 4, dtype=torch.bool),
+    }
+    loss, _ = policy.forward(batch)
+    assert loss.ndim == 0
+
+
+def test_act_policy_forward_with_segmentation_mask():
+    cam = f"{OBS_IMAGES}.cam"
+    mkey = "observation.init.hook_segmentation"
+    cfg = ACTConfig(use_vae=False, use_mask=True, chunk_size=4, n_action_steps=4)
+    cfg.input_features = {
+        cam: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 32, 32)),
+        mkey: PolicyFeature(type=FeatureType.MASK, shape=(1, 32, 32)),
+    }
+    cfg.output_features = {ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(2,))}
+    policy = ACTPolicy(cfg)
+    policy.train()
+    B = 2
+    batch = {
+        cam: torch.randn(B, 3, 32, 32),
+        mkey: torch.rand(B, 1, 32, 32) > 0.5,
+        ACTION: torch.randn(B, 4, 2),
+        "action_is_pad": torch.zeros(B, 4, dtype=torch.bool),
+    }
+    loss, _ = policy.forward(batch)
+    assert loss.ndim == 0
