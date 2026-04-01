@@ -89,6 +89,8 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
+        for key in self.config.tactile_features:
+            self._queues[key] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -182,6 +184,8 @@ class DiffusionModel(nn.Module):
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
+        if self.config.tactile_features:
+            global_cond_dim += sum(math.prod(ft.shape) for ft in self.config.tactile_features.values())
 
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
@@ -277,6 +281,10 @@ class DiffusionModel(nn.Module):
 
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
+        for key in self.config.tactile_features:
+            # TODO: Do we need tactile features to be in a specific shape or can we just flatten them and concatenate them as is?
+            # TODO: Do we need to do any encoding of tactile features or is flattening enough?
+            global_cond_feats.append(batch[key])
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
@@ -290,6 +298,8 @@ class DiffusionModel(nn.Module):
             "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
                 AND/OR
             "observation.environment_state": (B, n_obs_steps, environment_dim)
+                AND/OR
+            "observation.tactile*": (B, n_obs_steps, tactile_dim)
         }
         """
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
@@ -317,6 +327,8 @@ class DiffusionModel(nn.Module):
             "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
                 AND/OR
             "observation.environment_state": (B, n_obs_steps, environment_dim)
+                AND/OR
+            "observation.tactile*": (B, n_obs_steps, tactile_dim)
 
             "action": (B, horizon, action_dim)
             "action_is_pad": (B, horizon)
@@ -324,7 +336,8 @@ class DiffusionModel(nn.Module):
         """
         # Input validation.
         assert set(batch).issuperset({OBS_STATE, ACTION, "action_is_pad"})
-        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch
+        has_tactile = any(key in batch for key in self.config.tactile_features)
+        assert OBS_IMAGES in batch or OBS_ENV_STATE in batch or has_tactile
         n_obs_steps = batch[OBS_STATE].shape[1]
         horizon = batch[ACTION].shape[1]
         assert horizon == self.config.horizon

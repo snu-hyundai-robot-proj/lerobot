@@ -17,7 +17,7 @@
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.types import NormalizationMode
+from lerobot.configs.types import NormalizationMode, PolicyFeature
 from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
@@ -226,8 +226,10 @@ class DiffusionConfig(PreTrainedConfig):
         )
 
     def validate_features(self) -> None:
-        if len(self.image_features) == 0 and self.env_state_feature is None:
-            raise ValueError("You must provide at least one image or the environment state among the inputs.")
+        if len(self.image_features) == 0 and self.env_state_feature is None and len(self.tactile_features) == 0:
+            raise ValueError(
+                "You must provide at least one image, the environment state, or tactile features among the inputs."
+            )
 
         if self.resize_shape is None and self.crop_shape is not None:
             for key, image_ft in self.image_features.items():
@@ -245,6 +247,24 @@ class DiffusionConfig(PreTrainedConfig):
                     raise ValueError(
                         f"`{key}` does not match `{first_image_key}`, but we expect all image shapes to match."
                     )
+
+        # Tactile features are encoded as vectors and concatenated in the global conditioning.
+        for key, tactile_ft in self.tactile_features.items():
+            if len(tactile_ft.shape) != 1:
+                raise ValueError(
+                    f"`{key}` should be a 1D vector feature for diffusion tactile conditioning. "
+                    f"Got {tactile_ft.shape}."
+                )
+
+    @property
+    def tactile_features(self) -> dict[str, PolicyFeature]:
+        if not self.input_features:
+            return {}
+        return {
+            key: ft
+            for key, ft in self.input_features.items()
+            if key.startswith("observation.tactile")
+        }
 
     @property
     def observation_delta_indices(self) -> list:
