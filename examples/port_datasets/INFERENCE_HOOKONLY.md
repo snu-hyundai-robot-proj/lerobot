@@ -26,7 +26,19 @@
 4. postprocess 후 해당 8개 GT action과 비교
 
 ## 사용법
+### Pretrained Checkpoint 다운로드
+``` bash
+# 1) git-lfs 설치
+# **Ubuntu 예시**
+sudo apt-get update
+sudo apt-get install git-lfs
+# 2) 로컬 레포지토리에서 셋업
+git lfs install
+# 3) LFS 실제 파일 다운로드
+git lfs pull
+```
 
+### 실행
 ```bash
 conda activate lerobot
 cd /home/ngseo/remove_hook/lerobot
