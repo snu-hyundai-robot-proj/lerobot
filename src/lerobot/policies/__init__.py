@@ -12,30 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .act.configuration_act import ACTConfig as ACTConfig
-from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
-from .groot.configuration_groot import GrootConfig as GrootConfig
-from .pi0.configuration_pi0 import PI0Config as PI0Config
-from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
-from .pi05.configuration_pi05 import PI05Config as PI05Config
-from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
-from .smolvla.processor_smolvla import SmolVLANewLineProcessor
-from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
-from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
-from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
-from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
+_LAZY_IMPORTS = {
+    "ACTConfig": "lerobot.policies.act.configuration_act",
+    "DiffusionConfig": "lerobot.policies.diffusion.configuration_diffusion",
+    "GrootConfig": "lerobot.policies.groot.configuration_groot",
+    "PI0Config": "lerobot.policies.pi0.configuration_pi0",
+    "PI0FastConfig": "lerobot.policies.pi0_fast.configuration_pi0_fast",
+    "PI05Config": "lerobot.policies.pi05.configuration_pi05",
+    "SARMConfig": "lerobot.policies.sarm.configuration_sarm",
+    "SmolVLAConfig": "lerobot.policies.smolvla.configuration_smolvla",
+    "SmolVLANewLineProcessor": "lerobot.policies.smolvla.processor_smolvla",
+    "TDMPCConfig": "lerobot.policies.tdmpc.configuration_tdmpc",
+    "VQBeTConfig": "lerobot.policies.vqbet.configuration_vqbet",
+    "WallXConfig": "lerobot.policies.wall_x.configuration_wall_x",
+    "XVLAConfig": "lerobot.policies.xvla.configuration_xvla",
+    "get_policy_class": "lerobot.policies.factory",
+}
 
-__all__ = [
-    "ACTConfig",
-    "DiffusionConfig",
-    "PI0Config",
-    "PI05Config",
-    "PI0FastConfig",
-    "SmolVLAConfig",
-    "SARMConfig",
-    "TDMPCConfig",
-    "VQBeTConfig",
-    "GrootConfig",
-    "XVLAConfig",
-    "WallXConfig",
-]
+__all__ = list(_LAZY_IMPORTS)
+
+
+def __getattr__(name: str):
+    if name not in _LAZY_IMPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from importlib import import_module
+
+    module = import_module(_LAZY_IMPORTS[name])
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
