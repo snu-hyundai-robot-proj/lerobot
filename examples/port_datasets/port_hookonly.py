@@ -41,17 +41,20 @@ FPS = 60
 TASK_NAME = "remove hook ring from chassis"
 
 
-def build_features(action_dim: int, state_dim: int, img_h: int, img_w: int) -> dict:
-    return {
+CAMERA_HDF5_KEYS = {
+    "d405": "d405_rgb",
+    "zivid": "zivid_rgb",
+}
+
+
+def build_features(
+    action_dim: int, state_dim: int, img_h: int, img_w: int, cameras: list[str]
+) -> dict:
+    features: dict = {
         "observation.state": {
             "dtype": "float32",
             "shape": (state_dim,),
             "names": {"axes": [f"s{i}" for i in range(state_dim)]},
-        },
-        "observation.images.d405": {
-            "dtype": "video",
-            "shape": (img_h, img_w, 3),
-            "names": ["height", "width", "channels"],
         },
         "action": {
             "dtype": "float32",
@@ -59,6 +62,13 @@ def build_features(action_dim: int, state_dim: int, img_h: int, img_w: int) -> d
             "names": {"axes": [f"a{i}" for i in range(action_dim)]},
         },
     }
+    for cam in cameras:
+        features[f"observation.images.{cam}"] = {
+            "dtype": "video",
+            "shape": (img_h, img_w, 3),
+            "names": ["height", "width", "channels"],
+        }
+    return features
 
 
 def iter_sessions(src_root: Path, main_glob: str):
@@ -85,12 +95,14 @@ def convert(
     img_h: int,
     img_w: int,
     action_field: str,
+    cameras: list[str],
+    repo_id: str,
 ):
     spec = ROBOT_SPECS[robot]
-    features = build_features(spec["action_dim"], spec["state_dim"], img_h, img_w)
+    features = build_features(spec["action_dim"], spec["state_dim"], img_h, img_w, cameras)
 
     dataset = LeRobotDataset.create(
-        repo_id=f"local/{robot}_hookonly",
+        repo_id=repo_id,
         fps=FPS,
         features=features,
         root=out_root,
@@ -110,12 +122,19 @@ def convert(
                     logging.warning("%s %s: no matching images group, skipped", session_dir.name, demo_key)
                     continue
                 img_demo = fimg[demo_key]
+                missing_cams = [c for c in cameras if CAMERA_HDF5_KEYS[c] not in img_demo]
+                if missing_cams:
+                    logging.warning(
+                        "%s %s: missing camera groups %s, skipped",
+                        session_dir.name, demo_key, missing_cams,
+                    )
+                    continue
 
                 obs = np.asarray(demo["obs"], dtype=np.float32)
                 actions = np.asarray(demo[action_field], dtype=np.float32)
-                d405 = img_demo["d405_rgb"]  # (T, H, W, 3) uint8
+                cam_arrays = {c: img_demo[CAMERA_HDF5_KEYS[c]] for c in cameras}
 
-                T = min(obs.shape[0], actions.shape[0], d405.shape[0])
+                T = min(obs.shape[0], actions.shape[0], *(arr.shape[0] for arr in cam_arrays.values()))
                 if obs.shape[1] != spec["state_dim"] or actions.shape[1] != spec["action_dim"]:
                     raise RuntimeError(
                         f"shape mismatch in {main_path}:{demo_key} "
@@ -124,20 +143,22 @@ def convert(
                     )
 
                 logging.info(
-                    "episode %d  session=%s  demo=%s  T=%d", ep_index, session_dir.name, demo_key, T
+                    "episode %d  session=%s  demo=%s  T=%d  cams=%s",
+                    ep_index, session_dir.name, demo_key, T, cameras,
                 )
 
                 for t in range(T):
-                    raw_img = d405[t]  # (H, W, 3) uint8
-                    img = cv2.resize(raw_img, (img_w, img_h), interpolation=cv2.INTER_AREA)
-                    dataset.add_frame(
-                        {
-                            "observation.state": obs[t],
-                            "observation.images.d405": img,
-                            "action": actions[t],
-                            "task": TASK_NAME,
-                        }
-                    )
+                    frame: dict = {
+                        "observation.state": obs[t],
+                        "action": actions[t],
+                        "task": TASK_NAME,
+                    }
+                    for cam in cameras:
+                        raw = cam_arrays[cam][t]  # (H, W, 3) uint8
+                        frame[f"observation.images.{cam}"] = cv2.resize(
+                            raw, (img_w, img_h), interpolation=cv2.INTER_AREA
+                        )
+                    dataset.add_frame(frame)
                 dataset.save_episode()
                 ep_index += 1
 
@@ -152,11 +173,29 @@ def main():
     parser.add_argument("--img-h", type=int, default=240)
     parser.add_argument("--img-w", type=int, default=320)
     parser.add_argument("--action-field", choices=["actions", "processed_actions"], default="actions")
+    parser.add_argument(
+        "--cameras",
+        default="d405",
+        help="comma-separated subset of {d405,zivid}. e.g. 'd405,zivid' for multi-cam.",
+    )
+    parser.add_argument(
+        "--repo-id",
+        default=None,
+        help="LeRobot repo_id (defaults to local/<robot>_hookonly).",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level, format="%(asctime)s %(levelname)s %(message)s")
-    convert(args.src, args.out, args.robot, args.img_h, args.img_w, args.action_field)
+    cameras = [c.strip() for c in args.cameras.split(",") if c.strip()]
+    unknown = [c for c in cameras if c not in CAMERA_HDF5_KEYS]
+    if unknown:
+        raise SystemExit(f"unknown camera(s) {unknown}; supported: {sorted(CAMERA_HDF5_KEYS)}")
+    repo_id = args.repo_id or f"local/{args.robot}_hookonly"
+    convert(
+        args.src, args.out, args.robot, args.img_h, args.img_w,
+        args.action_field, cameras, repo_id,
+    )
 
 
 if __name__ == "__main__":

@@ -194,21 +194,36 @@ class DiffusionModel(nn.Module):
             # common in diffusion inference.
             self.unet = torch.compile(self.unet, mode=config.compile_mode)
 
-        self.noise_scheduler = _make_noise_scheduler(
-            config.noise_scheduler_type,
-            num_train_timesteps=config.num_train_timesteps,
-            beta_start=config.beta_start,
-            beta_end=config.beta_end,
-            beta_schedule=config.beta_schedule,
-            clip_sample=config.clip_sample,
-            clip_sample_range=config.clip_sample_range,
-            prediction_type=config.prediction_type,
-        )
+        if config.noise_scheduler_type == "FlowMatch":
+            # FlowMatch (rectified flow) doesn't use a diffusers scheduler — sampling is
+            # a direct Euler ODE integration in `_conditional_sample_flowmatch`.
+            self.noise_scheduler = None
+            # Default to 1-step inference unless the caller overrides.
+            self.num_inference_steps = (
+                config.num_inference_steps if config.num_inference_steps is not None else 1
+            )
+            self.rtc_processor = None
+            if config.use_rtc:
+                from lerobot.policies.rtc.configuration_rtc import RTCConfig
+                from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 
-        if config.num_inference_steps is None:
-            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
+                self.rtc_processor = RTCProcessor(RTCConfig())
         else:
-            self.num_inference_steps = config.num_inference_steps
+            self.noise_scheduler = _make_noise_scheduler(
+                config.noise_scheduler_type,
+                num_train_timesteps=config.num_train_timesteps,
+                beta_start=config.beta_start,
+                beta_end=config.beta_end,
+                beta_schedule=config.beta_schedule,
+                clip_sample=config.clip_sample,
+                clip_sample_range=config.clip_sample_range,
+                prediction_type=config.prediction_type,
+            )
+            if config.num_inference_steps is None:
+                self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
+            else:
+                self.num_inference_steps = config.num_inference_steps
+            self.rtc_processor = None
 
     # ========= inference  ============
     def conditional_sample(
@@ -218,6 +233,9 @@ class DiffusionModel(nn.Module):
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
+        if self.config.noise_scheduler_type == "FlowMatch":
+            return self._conditional_sample_flowmatch(batch_size, global_cond, generator, noise)
+
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
 
@@ -246,6 +264,72 @@ class DiffusionModel(nn.Module):
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
 
         return sample
+
+    def _conditional_sample_flowmatch(
+        self,
+        batch_size: int,
+        global_cond: Tensor | None,
+        generator: torch.Generator | None,
+        noise: Tensor | None,
+    ) -> Tensor:
+        """Euler ODE integration for rectified flow: x_{t+dt} = x_t + dt * v(x_t, t),
+        from t=0 (noise) to t=1 (data). Optionally early-stops on convergence
+        (AdaFlow-style) or wraps the denoiser with RTC."""
+        device = get_device_from_parameters(self)
+        dtype = get_dtype_from_parameters(self)
+        action_dim = self.config.action_feature.shape[0]
+        horizon = self.config.horizon
+        if noise is None:
+            x_t = torch.randn(
+                size=(batch_size, horizon, action_dim),
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+        else:
+            x_t = noise
+
+        if self.config.use_adaflow_inference:
+            n_steps = max(self.config.adaflow_max_steps, 1)
+        else:
+            n_steps = max(self.num_inference_steps, 1)
+        dt = 1.0 / n_steps
+        train_T = float(self.config.num_train_timesteps)
+
+        prev_x = x_t
+        for step in range(n_steps):
+            t_value = step * dt
+            t_emb = torch.full(
+                (batch_size,), t_value * train_T, device=device, dtype=torch.float32
+            )
+
+            def denoise(input_x_t: Tensor) -> Tensor:
+                return self.unet(input_x_t, t_emb, global_cond=global_cond)
+
+            if self.config.use_rtc and self.rtc_processor is not None:
+                v_t = self.rtc_processor.denoise_step(
+                    x_t=x_t,
+                    prev_chunk_left_over=getattr(self, "_rtc_prev_left_over", None),
+                    inference_delay=self.config.rtc_inference_delay,
+                    time=t_value,
+                    original_denoise_step_partial=denoise,
+                    execution_horizon=self.config.rtc_execution_horizon or None,
+                )
+            else:
+                v_t = denoise(x_t)
+
+            new_x = x_t + dt * v_t
+
+            if self.config.use_adaflow_inference and (step + 1) >= self.config.adaflow_min_steps:
+                rel_change = (new_x - x_t).abs().mean() / (x_t.abs().mean() + 1e-8)
+                x_t = new_x
+                if rel_change.item() < self.config.adaflow_convergence_threshold:
+                    break
+            else:
+                x_t = new_x
+            prev_x = new_x
+
+        return x_t
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
@@ -346,6 +430,9 @@ class DiffusionModel(nn.Module):
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
+        if self.config.noise_scheduler_type == "FlowMatch":
+            return self._compute_loss_flowmatch(batch, global_cond)
+
         # Forward diffusion.
         trajectory = batch[ACTION]
         # Sample noise to add to the trajectory.
@@ -384,6 +471,31 @@ class DiffusionModel(nn.Module):
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
+        return loss.mean()
+
+    def _compute_loss_flowmatch(self, batch: dict[str, Tensor], global_cond: Tensor) -> Tensor:
+        """Rectified-flow loss: predict velocity v ≈ x_1 - x_0, with t ~ U[0,1] and
+        x_t = (1-t) * x_0 + t * x_1 (x_1 = clean action, x_0 = noise)."""
+        x_1 = batch[ACTION]  # (B, horizon, action_dim)
+        x_0 = torch.randn_like(x_1)
+        bsz = x_1.shape[0]
+        t = torch.rand(bsz, device=x_1.device, dtype=x_1.dtype)
+        t_b = t.view(-1, 1, 1)
+        x_t = (1.0 - t_b) * x_0 + t_b * x_1
+        target_v = x_1 - x_0
+        # Scale t to match the sinusoidal positional embedding range used during DDIM
+        # training (otherwise t∈[0,1] excites only the lowest sinusoid frequencies).
+        t_emb_in = t * float(self.config.num_train_timesteps)
+        pred_v = self.unet(x_t, t_emb_in, global_cond=global_cond)
+        loss = F.mse_loss(pred_v, target_v, reduction="none")
+        if self.config.do_mask_loss_for_padding:
+            if "action_is_pad" not in batch:
+                raise ValueError(
+                    "You need to provide 'action_is_pad' in the batch when "
+                    f"{self.config.do_mask_loss_for_padding=}."
+                )
+            in_episode_bound = ~batch["action_is_pad"]
+            loss = loss * in_episode_bound.unsqueeze(-1)
         return loss.mean()
 
 
@@ -485,22 +597,35 @@ class DiffusionRgbEncoder(nn.Module):
             self.do_crop = False
 
         # Set up backbone.
-        backbone_model = getattr(torchvision.models, config.vision_backbone)(
-            weights=config.pretrained_backbone_weights
-        )
-        # Note: This assumes that the layer4 feature map is children()[-3]
-        # TODO(alexander-soare): Use a safer alternative.
-        self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
-        if config.use_group_norm:
-            if config.pretrained_backbone_weights:
-                raise ValueError(
-                    "You can't replace BatchNorm in a pretrained model without ruining the weights!"
-                )
-            self.backbone = _replace_submodules(
-                root_module=self.backbone,
-                predicate=lambda x: isinstance(x, nn.BatchNorm2d),
-                func=lambda x: nn.GroupNorm(num_groups=x.num_features // 16, num_channels=x.num_features),
+        if config.vision_backbone == "theia":
+            self.backbone = TheiaBackbone(
+                model_name=config.theia_model_name,
+                freeze=config.freeze_vision_backbone,
             )
+        elif config.vision_backbone == "dinov2":
+            self.backbone = Dinov2Backbone(
+                model_name=config.dinov2_model_name,
+                freeze=config.freeze_vision_backbone,
+            )
+        else:
+            backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                weights=config.pretrained_backbone_weights
+            )
+            # Note: This assumes that the layer4 feature map is children()[-3]
+            # TODO(alexander-soare): Use a safer alternative.
+            self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
+            if config.use_group_norm:
+                if config.pretrained_backbone_weights:
+                    raise ValueError(
+                        "You can't replace BatchNorm in a pretrained model without ruining the weights!"
+                    )
+                self.backbone = _replace_submodules(
+                    root_module=self.backbone,
+                    predicate=lambda x: isinstance(x, nn.BatchNorm2d),
+                    func=lambda x: nn.GroupNorm(
+                        num_groups=x.num_features // 16, num_channels=x.num_features
+                    ),
+                )
 
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
@@ -544,6 +669,107 @@ class DiffusionRgbEncoder(nn.Module):
         # Final linear layer with non-linearity.
         x = self.relu(self.out(x))
         return x
+
+
+class TheiaBackbone(nn.Module):
+    """Theia ViT backbone wrapper that returns a 2D feature map (B, D, h, w)
+    so the existing SpatialSoftmax pipeline keeps working unchanged.
+
+    Theia expects pixel range [0, 255] uint8 in (B, H, W, C). We accept the standard
+    LeRobot float [0, 1] (B, C, H, W) and convert internally.
+    """
+
+    def __init__(self, model_name: str, freeze: bool = True):
+        super().__init__()
+        from transformers import AutoModel
+
+        self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+        # Force spatial-token output regardless of how the checkpoint was configured.
+        if hasattr(self.model, "feature_reduce_method"):
+            self.model.feature_reduce_method = None
+        self._freeze = freeze
+        if freeze:
+            for p in self.model.parameters():
+                p.requires_grad = False
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self._freeze:
+            self.model.eval()
+        return self
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Theia is locked to 224x224. Resize defensively in case the encoder's
+        # resize/crop config produced a different size.
+        if x.shape[-2:] != (224, 224):
+            x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        # (B, C, H, W) float in [0, 1] → (B, H, W, C) uint8 in [0, 255]
+        x_in = (x.clamp(0.0, 1.0) * 255.0).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
+        ctx = torch.no_grad() if self._freeze else _NullCtx()
+        with ctx:
+            feat = self.model.forward_feature(x_in)  # (B, N, D)
+        b, n, d = feat.shape
+        h = w = int(round(n**0.5))
+        if h * w != n:
+            raise RuntimeError(f"Theia returned non-square patch grid: N={n}")
+        return feat.transpose(1, 2).reshape(b, d, h, w).contiguous()
+
+
+class _NullCtx:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *args):
+        return False
+
+
+class Dinov2Backbone(nn.Module):
+    """DINOv2 ViT backbone wrapper that returns a 2D feature map (B, D, h, w)
+    so the existing SpatialSoftmax / IntermediateLayerGetter pipeline keeps working.
+
+    Accepts standard LeRobot float [0, 1] (B, C, H, W) input. ImageNet-normalizes
+    internally, so the policy must set VISUAL normalization to IDENTITY (handled
+    automatically in the config's __post_init__).
+    """
+
+    IMAGENET_MEAN = (0.485, 0.456, 0.406)
+    IMAGENET_STD = (0.229, 0.224, 0.225)
+
+    def __init__(self, model_name: str, freeze: bool = True):
+        super().__init__()
+        from transformers import AutoModel
+
+        self.model = AutoModel.from_pretrained(model_name)
+        self._freeze = freeze
+        if freeze:
+            for p in self.model.parameters():
+                p.requires_grad = False
+        self.register_buffer("_mean", torch.tensor(self.IMAGENET_MEAN).view(1, 3, 1, 1))
+        self.register_buffer("_std", torch.tensor(self.IMAGENET_STD).view(1, 3, 1, 1))
+        # DINOv2 uses patch_size=14 with 224x224 input → 16x16 = 256 patches.
+        self.patch_size = getattr(self.model.config, "patch_size", 14)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self._freeze:
+            self.model.eval()
+        return self
+
+    def forward(self, x: Tensor) -> Tensor:
+        # DINOv2 needs spatial dims divisible by patch_size. Resize to 224x224 (clean default).
+        if x.shape[-2:] != (224, 224):
+            x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
+        x = (x.clamp(0.0, 1.0) - self._mean) / self._std
+        ctx = torch.no_grad() if self._freeze else _NullCtx()
+        with ctx:
+            out = self.model(pixel_values=x)
+        # last_hidden_state: (B, 1 + N, D) — drop CLS at index 0.
+        feat = out.last_hidden_state[:, 1:, :]
+        b, n, d = feat.shape
+        h = w = int(round(n**0.5))
+        if h * w != n:
+            raise RuntimeError(f"DINOv2 returned non-square patch grid: N={n}")
+        return feat.transpose(1, 2).reshape(b, d, h, w).contiguous()
 
 
 def _replace_submodules(

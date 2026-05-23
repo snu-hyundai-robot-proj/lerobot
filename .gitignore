@@ -156,26 +156,31 @@ nautilus/*.yaml
 *.key
 sbatch*.sh
 
-### Miscellaneous ###
+### Training Artifacts ###
+# Ignore all training outputs by default. Already-committed checkpoints stay
+# tracked (gitignore doesn't untrack); new training runs are excluded.
+outputs/
+
 # W&B
 wandb/
 
-# Dev scripts
-.dev/
-
-# Data folders
+### Data folders ###
 data/
-outputs/*
-!outputs/train/
-!outputs/train/**
 
-# Translations
-*.mo
-*.pot
+### Archives (often large local-only blobs) ###
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
 
-# Dev folders
-.cache/*
+### Robotics assets (kept local; LFS handles them if explicitly added) ###
 *.stl
 *.urdf
 *.xml
 *.part
+
+### Misc ###
+.dev/
+*.mo
+*.pot

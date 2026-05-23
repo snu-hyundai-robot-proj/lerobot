@@ -118,8 +118,14 @@ class DiffusionConfig(PreTrainedConfig):
     drop_n_last_frames: int = 7  # horizon - n_action_steps - n_obs_steps + 1
 
     # Architecture / modeling.
-    # Vision backbone.
+    # Vision backbone. Either a torchvision ResNet variant ("resnet18", ...) or "theia"
+    # to use the Theia robot vision foundation model (loaded from HuggingFace).
     vision_backbone: str = "resnet18"
+    # Theia-specific options (only used when vision_backbone == "theia").
+    theia_model_name: str = "theaiinstitute/theia-tiny-patch16-224-cdiv"
+    # DINOv2-specific options (only used when vision_backbone == "dinov2").
+    dinov2_model_name: str = "facebook/dinov2-small"
+    freeze_vision_backbone: bool = True
     resize_shape: tuple[int, int] | None = None
     crop_ratio: float = 1.0
     crop_shape: tuple[int, int] | None = None
@@ -134,7 +140,10 @@ class DiffusionConfig(PreTrainedConfig):
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
-    # Noise scheduler.
+    # Noise scheduler. Either "DDPM"/"DDIM" (epsilon-prediction diffusion) or
+    # "FlowMatch" (rectified-flow / velocity-prediction). FlowMatch enables 1~few-step
+    # inference, with optional variance-adaptive step count (`use_adaflow_inference`)
+    # or Real-Time Chunking wrapping (`use_rtc`).
     noise_scheduler_type: str = "DDIM"
     num_train_timesteps: int = 100
     beta_schedule: str = "squaredcos_cap_v2"
@@ -146,6 +155,15 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inference
     num_inference_steps: int | None = None
+    # Variance-adaptive inference (AdaFlow-style; only meaningful when noise_scheduler_type="FlowMatch").
+    use_adaflow_inference: bool = False
+    adaflow_min_steps: int = 1
+    adaflow_max_steps: int = 4
+    adaflow_convergence_threshold: float = 0.01
+    # Real-Time Chunking wrapping (only for noise_scheduler_type="FlowMatch").
+    use_rtc: bool = False
+    rtc_inference_delay: int = 0
+    rtc_execution_horizon: int = 0
 
     # Optimization
     compile_model: bool = False
@@ -166,22 +184,41 @@ class DiffusionConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
+        if not (
+            self.vision_backbone.startswith("resnet")
+            or self.vision_backbone in ("theia", "dinov2")
+        ):
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                f"`vision_backbone` must be a ResNet variant, 'theia', or 'dinov2'. "
+                f"Got {self.vision_backbone}."
             )
+
+        if self.vision_backbone in ("theia", "dinov2"):
+            # These foundation backbones run their own internal preprocessing.
+            # Override VISUAL normalization to IDENTITY so the encoder receives float [0, 1]
+            # images straight from the dataset (the backbone wrapper handles the rest).
+            if self.normalization_mapping.get("VISUAL") != NormalizationMode.IDENTITY:
+                self.normalization_mapping = {
+                    **self.normalization_mapping,
+                    "VISUAL": NormalizationMode.IDENTITY,
+                }
 
         supported_prediction_types = ["epsilon", "sample"]
         if self.prediction_type not in supported_prediction_types:
             raise ValueError(
                 f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
             )
-        supported_noise_schedulers = ["DDPM", "DDIM"]
+        supported_noise_schedulers = ["DDPM", "DDIM", "FlowMatch"]
         if self.noise_scheduler_type not in supported_noise_schedulers:
             raise ValueError(
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
             )
+        if self.noise_scheduler_type != "FlowMatch":
+            if self.use_adaflow_inference:
+                raise ValueError("`use_adaflow_inference` requires `noise_scheduler_type='FlowMatch'`.")
+            if self.use_rtc:
+                raise ValueError("`use_rtc` requires `noise_scheduler_type='FlowMatch'`.")
 
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)

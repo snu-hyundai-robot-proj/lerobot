@@ -63,6 +63,18 @@ def _pack_act_policy_batch(config: ACTConfig, batch: dict[str, Tensor]) -> dict[
     return out
 
 
+class _DictWrap(nn.Module):
+    """Wrap a backbone that returns a tensor so it returns {'feature_map': tensor},
+    matching the IntermediateLayerGetter interface ACT expects."""
+
+    def __init__(self, inner: nn.Module):
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        return {"feature_map": self.inner(x)}
+
+
 class TactileCNN1DEncoder(nn.Module):
     """Single 1D CNN over the full tactile vector: (B, tactile_dim) -> (B, 1, d_model)."""
 
@@ -389,15 +401,37 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            if config.vision_backbone in ("theia", "dinov2"):
+                if config.vision_backbone == "theia":
+                    from lerobot.policies.diffusion.modeling_diffusion import TheiaBackbone
+
+                    _vit = TheiaBackbone(
+                        model_name=config.theia_model_name,
+                        freeze=config.freeze_vision_backbone,
+                    )
+                else:
+                    from lerobot.policies.diffusion.modeling_diffusion import Dinov2Backbone
+
+                    _vit = Dinov2Backbone(
+                        model_name=config.dinov2_model_name,
+                        freeze=config.freeze_vision_backbone,
+                    )
+                # Output dim is needed for the 1x1 projection below; do a dry run to discover it.
+                with torch.inference_mode():
+                    _vit_out_channels = _vit(torch.zeros(1, 3, 224, 224)).shape[1]
+                self.backbone = _DictWrap(_vit)
+                self._backbone_out_channels = _vit_out_channels
+            else:
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
+                # feature map).
+                # Note: The forward method of this returns a dict: {"feature_map": output}.
+                self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+                self._backbone_out_channels = backbone_model.fc.in_features
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -416,7 +450,7 @@ class ACT(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                self._backbone_out_channels, config.dim_model, kernel_size=1
             )
         if self.config.use_tactile:
             self.tactile_encoder = TactileCNN1DEncoder(

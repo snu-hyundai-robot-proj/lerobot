@@ -100,10 +100,16 @@ class ACTConfig(PreTrainedConfig):
     )
 
     # Architecture.
-    # Vision backbone.
+    # Vision backbone. Either a torchvision ResNet variant ("resnet18", ...) or "theia"
+    # to use the Theia robot vision foundation model (loaded from HuggingFace).
     vision_backbone: str = "resnet18"
     pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
     replace_final_stride_with_dilation: int = False
+    # Theia-specific options (only used when vision_backbone == "theia").
+    theia_model_name: str = "theaiinstitute/theia-tiny-patch16-224-cdiv"
+    # DINOv2-specific options (only used when vision_backbone == "dinov2").
+    dinov2_model_name: str = "facebook/dinov2-small"
+    freeze_vision_backbone: bool = True
     # Transformer layers.
     pre_norm: bool = False
     dim_model: int = 512
@@ -148,10 +154,22 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
-        if not self.vision_backbone.startswith("resnet"):
+        if not (
+            self.vision_backbone.startswith("resnet")
+            or self.vision_backbone in ("theia", "dinov2")
+        ):
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                f"`vision_backbone` must be a ResNet variant, 'theia', or 'dinov2'. "
+                f"Got {self.vision_backbone}."
             )
+
+        if self.vision_backbone in ("theia", "dinov2"):
+            # These foundation backbones run their own internal preprocessing.
+            if self.normalization_mapping.get("VISUAL") != NormalizationMode.IDENTITY:
+                self.normalization_mapping = {
+                    **self.normalization_mapping,
+                    "VISUAL": NormalizationMode.IDENTITY,
+                }
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(
                 "`n_action_steps` must be 1 when using temporal ensembling. This is "
