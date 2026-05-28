@@ -134,6 +134,21 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
+
+    # Segmentation masks (FeatureType.MASK). When True, a small CNN tower encodes each
+    # mask, then spatial-mean pools to a vector of length `mask_feature_dim` that is
+    # concatenated into the diffusion model's global conditioning vector (alongside
+    # state and RGB keypoint features).
+    #
+    # Masks are stored packed (np.packbits → 1D uint8) on disk because pyarrow's
+    # nested-list decode of 3D bool tensors is ~50x slower than 1D primitive reads.
+    # The unpacked shape (mask_height, mask_width) must therefore be supplied here
+    # so the model can reshape after np.unpackbits at forward time.
+    use_mask: bool = False
+    mask_encoder_base_dim: int = 64
+    mask_feature_dim: int = 128
+    mask_height: int = 240
+    mask_width: int = 320
     # Unet.
     down_dims: tuple[int, ...] = (512, 1024, 2048)
     kernel_size: int = 5
@@ -220,6 +235,16 @@ class DiffusionConfig(PreTrainedConfig):
             if self.use_rtc:
                 raise ValueError("`use_rtc` requires `noise_scheduler_type='FlowMatch'`.")
 
+        if self.use_mask:
+            if self.mask_encoder_base_dim < 1:
+                raise ValueError(
+                    f"`mask_encoder_base_dim` must be >= 1, got {self.mask_encoder_base_dim}."
+                )
+            if self.mask_feature_dim < 1:
+                raise ValueError(
+                    f"`mask_feature_dim` must be >= 1, got {self.mask_feature_dim}."
+                )
+
         if self.resize_shape is not None and (
             len(self.resize_shape) != 2 or any(d <= 0 for d in self.resize_shape)
         ):
@@ -267,6 +292,22 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 "You must provide at least one image, the environment state, or tactile features among the inputs."
             )
+
+        if self.use_mask:
+            if not self.mask_features:
+                raise ValueError(
+                    "`use_mask=True` requires at least one FeatureType.MASK observation in `input_features`. "
+                    "Add e.g. observation.masks.zivid when porting the dataset."
+                )
+            expected_packed_len = (self.mask_height * self.mask_width + 7) // 8
+            for key, ft in self.mask_features.items():
+                if len(ft.shape) != 1 or ft.shape[0] != expected_packed_len:
+                    raise ValueError(
+                        f"Mask feature {key!r} must be a 1D packed-bit tensor of length "
+                        f"ceil(mask_height·mask_width/8) = {expected_packed_len}; got shape {ft.shape}. "
+                        f"Re-port the dataset with examples/port_datasets/port_hookonly.py --masks "
+                        f"or adjust mask_height/mask_width."
+                    )
 
         if self.resize_shape is None and self.crop_shape is not None:
             for key, image_ft in self.image_features.items():

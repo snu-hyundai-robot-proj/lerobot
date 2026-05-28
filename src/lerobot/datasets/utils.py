@@ -736,6 +736,11 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
             names = ft.get("names") or []
             if len(names) >= 3 and names[2] in ["channel", "channels"]:
                 shape = (shape[2], shape[0], shape[1])
+        elif key.startswith("observation.masks."):
+            # Packed-bit masks (1D uint8) or other compact mask representations.
+            # Parquet stores nested-list 3D bool ~50x slower than flat 1D uint8, so we
+            # accept any shape here and let the policy unpack/reshape at forward time.
+            type = FeatureType.MASK
         elif key.startswith(OBS_STR):
             type = FeatureType.STATE
         elif key.startswith(ACTION):

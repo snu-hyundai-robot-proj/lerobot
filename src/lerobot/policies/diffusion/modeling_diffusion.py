@@ -91,6 +91,9 @@ class DiffusionPolicy(PreTrainedPolicy):
             self._queues[OBS_ENV_STATE] = deque(maxlen=self.config.n_obs_steps)
         for key in self.config.tactile_features:
             self._queues[key] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.use_mask:
+            for key in self.config.mask_features:
+                self._queues[key] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
@@ -142,12 +145,18 @@ class DiffusionPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
-        if self.config.image_features:
+        if self.config.image_features or (self.config.use_mask and self.config.mask_features):
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+        if self.config.image_features:
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+        if self.config.use_mask and self.config.mask_features:
+            for key in self.config.mask_features:
+                # packed mask is (B, packed_len) when n_obs_steps==1 and (B, n_obs_steps, packed_len) otherwise.
+                if self.config.n_obs_steps == 1 and batch[key].ndim == 2:
+                    batch[key] = batch[key].unsqueeze(1)
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
@@ -164,6 +173,41 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         return DDIMScheduler(**kwargs)
     else:
         raise ValueError(f"Unsupported noise scheduler type {name}")
+
+
+def _mask_key_to_module_name(key: str) -> str:
+    """Convert a dataset feature key (with dots) to a valid nn.ModuleDict key."""
+    return key.replace(".", "_")
+
+
+class DiffusionMaskEncoder(nn.Module):
+    """Small CNN tower for segmentation masks.
+
+    Mirrors the structure of ACT's MaskSpatialEncoder: three stride-2 3×3 convs +
+    GELU, then a 1×1 projection. The output spatial feature map is later spatial-mean
+    pooled and concatenated into the diffusion global conditioning vector.
+
+    Input  : (B, C, H, W) — float, typically a binary mask cast from bool.
+    Output : (B, out_dim, H/8, W/8)
+    """
+
+    def __init__(self, in_channels: int, base_dim: int, out_dim: int) -> None:
+        super().__init__()
+        if in_channels < 1:
+            raise ValueError(f"in_channels must be >= 1, got {in_channels}")
+        mid = base_dim * 2
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, base_dim, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(base_dim, mid, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+            nn.Conv2d(mid, mid, kernel_size=3, stride=2, padding=1),
+            nn.GELU(),
+        )
+        self.proj = nn.Conv2d(mid, out_dim, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(self.net(x))
 
 
 class DiffusionModel(nn.Module):
@@ -186,6 +230,28 @@ class DiffusionModel(nn.Module):
             global_cond_dim += self.config.env_state_feature.shape[0]
         if self.config.tactile_features:
             global_cond_dim += sum(math.prod(ft.shape) for ft in self.config.tactile_features.values())
+
+        # Optional segmentation-mask encoders (FeatureType.MASK). Each mask gets its own
+        # small CNN tower; per-mask features are spatial-mean pooled to a vector of
+        # length `mask_feature_dim` and concatenated into the global conditioning.
+        if self.config.use_mask and self.config.mask_features:
+            # Masks are stored packed (1D uint8 row per frame) and unpacked to a single
+            # binary channel of shape (1, mask_height, mask_width) at forward time.
+            # Therefore the conv encoder always sees in_channels=1, independent of the
+            # packed feature length stored in `mask_features`.
+            self.mask_encoders = nn.ModuleDict(
+                {
+                    _mask_key_to_module_name(key): DiffusionMaskEncoder(
+                        in_channels=1,
+                        base_dim=self.config.mask_encoder_base_dim,
+                        out_dim=self.config.mask_feature_dim,
+                    )
+                    for key in self.config.mask_features
+                }
+            )
+            global_cond_dim += self.config.mask_feature_dim * len(self.config.mask_features)
+        else:
+            self.mask_encoders = None
 
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
@@ -369,6 +435,31 @@ class DiffusionModel(nn.Module):
             # TODO: Do we need tactile features to be in a specific shape or can we just flatten them and concatenate them as is?
             # TODO: Do we need to do any encoding of tactile features or is flattening enough?
             global_cond_feats.append(batch[key])
+
+        # Optional mask features. Masks are stored on disk as packed bits — a flat
+        # uint8 row of length ceil(H·W/8) per frame — so we unpack and reshape to
+        # (B*n_obs_steps, 1, H, W) here before feeding the conv encoder.
+        # Encode → (B*n_obs_steps, F, h', w'), spatial-mean pool → (B, n_obs_steps, F),
+        # then concat alongside state / image features (still (B, n_obs_steps, *)).
+        if self.config.use_mask and self.mask_encoders is not None:
+            H, W = self.config.mask_height, self.config.mask_width
+            for key in self.config.mask_features:
+                m = batch[key]                          # (B, n_obs_steps, packed_len) uint-like
+                packed = m.to(torch.uint8).reshape(batch_size * n_obs_steps, -1)
+                # Manual unpackbits (torch has no native equivalent), MSB-first to match
+                # numpy's np.packbits default in the porter.
+                shifts = torch.arange(7, -1, -1, dtype=torch.uint8, device=packed.device)
+                bits = (packed.unsqueeze(-1) >> shifts) & 1          # (B*s, packed_len, 8)
+                bits = bits.reshape(batch_size * n_obs_steps, -1)    # (B*s, packed_len*8)
+                bits = bits[:, : H * W]                              # drop padding bits
+                m_flat = bits.to(dtype=batch[OBS_STATE].dtype).reshape(
+                    batch_size * n_obs_steps, 1, H, W
+                )
+                encoder = self.mask_encoders[_mask_key_to_module_name(key)]
+                feat = encoder(m_flat)                   # (B*s, F, h', w')
+                feat = feat.mean(dim=(-1, -2))           # spatial mean → (B*s, F)
+                feat = einops.rearrange(feat, "(b s) f -> b s f", b=batch_size, s=n_obs_steps)
+                global_cond_feats.append(feat)
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
